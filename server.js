@@ -16,6 +16,8 @@
 //   Client -> Server
 //     {type:'create-room', hostName}
 //     {type:'join-room', code, joinerName}
+//     {type:'quick-match', name}       (join the matchmaking queue for a random opponent)
+//     {type:'cancel-quick-match'}
 //     {type:'state', state}            (host only)
 //     {type:'intent', action}          (joiner only)
 //     {type:'leave'}
@@ -25,11 +27,19 @@
 //     {type:'joined', code, state}     (state is the host's last pushed state, or null)
 //     {type:'room-not-found'}
 //     {type:'joiner-joined', joinerName}   (to host)
+//     {type:'quick-match-waiting'}                                (to the player now queued)
+//     {type:'quick-match-matched', code, seat, opponentName}      (seat: 'host'|'joiner', to both)
 //     {type:'state', state}                (to joiner, relayed from host)
 //     {type:'intent', action}              (to host, relayed from joiner)
 //     {type:'peer-left'}
 //     {type:'error', message}
 //     {type:'pong'}
+//
+// Quick Match pairs two waiting players automatically instead of exchanging a room code by hand.
+// It's built on top of the exact same room bookkeeping as Host/Join Room — the moment two players
+// are queued, the server picks one as host and one as joiner, opens a room for them exactly like
+// create-room/join-room would, and tells both sides at once via quick-match-matched. Everything
+// downstream (state sync, intents, leaving) is identical to a manually-coded room from there.
 //
 // ============================= ABUSE PROTECTION =============================
 // This server is reachable by anyone on the internet, so a few simple limits guard against one
@@ -40,31 +50,37 @@
 //   - ROOM_CREATE_LIMIT: caps how many rooms one IP can create in a rolling time window.
 //   - MSG_RATE_LIMIT: caps how many messages a single connection can send per second before
 //     it gets disconnected outright (way above what normal play ever needs).
- 
+
 const http = require('http');
 const { WebSocketServer } = require('ws');
- 
+
 const PORT = process.env.PORT || 8080;
 // No 0/O/1/I — easy to read aloud, matches the game's original room-code alphabet.
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MAX_ROOM_AGE_MS = 6 * 60 * 60 * 1000; // sweep abandoned rooms after 6 hours of no activity
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
- 
+
 const MAX_CONNECTIONS_PER_IP = 20;          // generous — covers many friends testing behind one router
 const ROOM_CREATE_LIMIT = 15;               // max rooms one IP may create...
 const ROOM_CREATE_WINDOW_MS = 5 * 60 * 1000; // ...per rolling 5 minutes
 const MSG_RATE_LIMIT = 30;                  // max messages per connection...
 const MSG_RATE_WINDOW_MS = 1000;            // ...per rolling 1 second (normal play is ~2-3/sec)
- 
+
 /** @type {Map<string, {host: import('ws').WebSocket|null, joiner: import('ws').WebSocket|null,
  *   hostName: string, joinerName: string|null, lastState: any, lastActivity: number}>} */
 const rooms = new Map();
- 
+
 /** @type {Map<string, number>} connections currently open, per IP */
 const connectionsByIp = new Map();
 /** @type {Map<string, {count: number, windowStart: number}>} room-creation counter, per IP */
 const roomCreatesByIp = new Map();
- 
+
+// At most one player waiting for Quick Match at a time — the moment a second player asks for one,
+// they're paired immediately and this goes back to null. A single slot (rather than a queue) is
+// all a 1v1 game ever needs.
+/** @type {{ws: import('ws').WebSocket, name: string} | null} */
+let quickMatchWaiting = null;
+
 function clientIp(req){
   // Render (and most hosts) sit behind a proxy, so the real client address is in this header —
   // fall back to the raw socket address for local/direct connections (e.g. testing).
@@ -72,7 +88,7 @@ function clientIp(req){
   if(fwd) return fwd.split(',')[0].trim();
   return req.socket.remoteAddress || 'unknown';
 }
- 
+
 function genRoomCode(){
   let code;
   do {
@@ -81,17 +97,17 @@ function genRoomCode(){
   } while(rooms.has(code)); // guarantee uniqueness — collisions are rare but cheap to rule out
   return code;
 }
- 
+
 function send(ws, msg){
   if(ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
- 
+
 function closeRoomIfEmpty(code){
   const room = rooms.get(code);
   if(!room) return;
   if(!room.host && !room.joiner) rooms.delete(code);
 }
- 
+
 // True if this IP is allowed to create one more room right now, and records the attempt either
 // way (so repeated abuse keeps tripping the limit rather than resetting it).
 function allowRoomCreate(ip){
@@ -104,7 +120,7 @@ function allowRoomCreate(ip){
   entry.count++;
   return entry.count <= ROOM_CREATE_LIMIT;
 }
- 
+
 // Periodic sweep for rooms nobody ever cleaned up (e.g. a crashed tab that never sent a
 // close frame) — keeps memory bounded on a long-running server with many rooms. Also clears out
 // old room-creation counters so that map doesn't grow forever either.
@@ -121,19 +137,19 @@ setInterval(() => {
     if(now - entry.windowStart > ROOM_CREATE_WINDOW_MS) roomCreatesByIp.delete(ip);
   }
 }, SWEEP_INTERVAL_MS).unref();
- 
+
 const server = http.createServer((req, res) => {
   // Plain health-check endpoint — most hosts (Render, Railway, Fly) ping this to confirm the
   // service is alive; it's also just a handy "is my server up" URL to open in a browser.
   res.writeHead(200, {'Content-Type': 'text/plain'});
   res.end(`Football Auction relay server — ${rooms.size} room(s) active.`);
 });
- 
+
 const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 }); // 2MB/message cap
- 
+
 wss.on('connection', (ws, req) => {
   const ip = clientIp(req);
- 
+
   // Reject outright if this IP already has too many sockets open — cheap way to stop one
   // misbehaving client (or bot) from exhausting server resources meant for everyone.
   const openCount = connectionsByIp.get(ip) || 0;
@@ -143,15 +159,18 @@ wss.on('connection', (ws, req) => {
     return;
   }
   connectionsByIp.set(ip, openCount + 1);
- 
-  // Which room/seat this specific socket belongs to, once it creates or joins one.
-  let myCode = null;
-  let mySeat = null; // 'host' | 'joiner'
- 
+
+  // Which room/seat this specific socket belongs to, once it creates or joins one. Stored ON the
+  // socket itself (not a closure variable) because Quick Match pairing needs to set this for the
+  // OTHER, already-connected socket too — from inside THIS connection's message handler, when it's
+  // the second player that completes the pair.
+  ws.myCode = null;
+  ws.mySeat = null; // 'host' | 'joiner'
+
   // Simple per-connection message-rate counter — resets every MSG_RATE_WINDOW_MS.
   let msgCount = 0;
   let msgWindowStart = Date.now();
- 
+
   ws.on('message', (raw) => {
     const now = Date.now();
     if(now - msgWindowStart > MSG_RATE_WINDOW_MS){ msgWindowStart = now; msgCount = 0; }
@@ -161,13 +180,13 @@ wss.on('connection', (ws, req) => {
       ws.close();
       return;
     }
- 
+
     let msg;
     try { msg = JSON.parse(raw); } catch(e){ send(ws, {type:'error', message:'Malformed message.'}); return; }
     if(!msg || typeof msg.type !== 'string') return;
- 
+
     if(msg.type === 'ping'){ send(ws, {type:'pong'}); return; }
- 
+
     if(msg.type === 'create-room'){
       if(!allowRoomCreate(ip)){
         send(ws, {type:'error', message:'Too many rooms created recently. Try again in a few minutes.'});
@@ -180,11 +199,11 @@ wss.on('connection', (ws, req) => {
         joinerName: null, lastState: null,
         lastActivity: Date.now(),
       });
-      myCode = code; mySeat = 'host';
+      ws.myCode = code; ws.mySeat = 'host';
       send(ws, {type:'room-created', code});
       return;
     }
- 
+
     if(msg.type === 'join-room'){
       const code = String(msg.code || '').trim().toUpperCase();
       const room = rooms.get(code);
@@ -192,49 +211,90 @@ wss.on('connection', (ws, req) => {
       room.joiner = ws;
       room.joinerName = String(msg.joinerName || 'Player 2').slice(0, 40);
       room.lastActivity = Date.now();
-      myCode = code; mySeat = 'joiner';
+      ws.myCode = code; ws.mySeat = 'joiner';
       send(ws, {type:'joined', code, state: room.lastState});
       send(room.host, {type:'joiner-joined', joinerName: room.joinerName});
       return;
     }
- 
+
+    if(msg.type === 'quick-match'){
+      const myName = String(msg.name || 'Player').slice(0, 40);
+      // Guard against a client double-clicking Quick Match (or retrying) and ending up queued
+      // against itself.
+      if(quickMatchWaiting && quickMatchWaiting.ws === ws) return;
+      if(!quickMatchWaiting || quickMatchWaiting.ws.readyState !== quickMatchWaiting.ws.OPEN){
+        quickMatchWaiting = { ws, name: myName };
+        send(ws, {type:'quick-match-waiting'});
+        return;
+      }
+      // Someone's already waiting — pair up. They become the host (their room already exists in
+      // spirit, they were first), this new arrival is the joiner. Reuses the same `rooms` map and
+      // message shapes as a manually-coded room, so every message after this point (state/intent/
+      // leave) works identically to Host Room + Join Room.
+      if(!allowRoomCreate(ip)){
+        send(ws, {type:'error', message:'Too many rooms created recently. Try again in a few minutes.'});
+        return;
+      }
+      const waiting = quickMatchWaiting;
+      quickMatchWaiting = null;
+      const code = genRoomCode();
+      rooms.set(code, {
+        host: waiting.ws, joiner: ws,
+        hostName: waiting.name, joinerName: myName, lastState: null,
+        lastActivity: Date.now(),
+      });
+      ws.myCode = code; ws.mySeat = 'joiner';
+      waiting.ws.myCode = code; waiting.ws.mySeat = 'host';
+      send(ws, {type:'quick-match-matched', code, seat:'joiner', opponentName: waiting.name});
+      send(waiting.ws, {type:'quick-match-matched', code, seat:'host', opponentName: myName});
+      return;
+    }
+
+    if(msg.type === 'cancel-quick-match'){
+      if(quickMatchWaiting && quickMatchWaiting.ws === ws) quickMatchWaiting = null;
+      return;
+    }
+
     // Everything past this point needs an established room + seat.
-    const room = myCode ? rooms.get(myCode) : null;
+    const room = ws.myCode ? rooms.get(ws.myCode) : null;
     if(!room){ send(ws, {type:'error', message:'Not in a room.'}); return; }
     room.lastActivity = Date.now();
- 
-    if(msg.type === 'state' && mySeat === 'host'){
+
+    if(msg.type === 'state' && ws.mySeat === 'host'){
       room.lastState = msg.state;
       send(room.joiner, {type:'state', state: msg.state});
       return;
     }
-    if(msg.type === 'intent' && mySeat === 'joiner'){
+    if(msg.type === 'intent' && ws.mySeat === 'joiner'){
       send(room.host, {type:'intent', action: msg.action});
       return;
     }
     if(msg.type === 'leave'){
-      if(mySeat === 'host') room.host = null; else room.joiner = null;
-      send(mySeat === 'host' ? room.joiner : room.host, {type:'peer-left'});
-      closeRoomIfEmpty(myCode);
-      myCode = null; mySeat = null;
+      if(ws.mySeat === 'host') room.host = null; else room.joiner = null;
+      send(ws.mySeat === 'host' ? room.joiner : room.host, {type:'peer-left'});
+      closeRoomIfEmpty(ws.myCode);
+      ws.myCode = null; ws.mySeat = null;
       return;
     }
   });
- 
+
   ws.on('close', () => {
     const remaining = (connectionsByIp.get(ip) || 1) - 1;
     if(remaining <= 0) connectionsByIp.delete(ip); else connectionsByIp.set(ip, remaining);
- 
-    if(!myCode) return;
-    const room = rooms.get(myCode);
+
+    // Clear the matchmaking slot if it was this socket waiting — otherwise the next player to
+    // ask for Quick Match would get "paired" with a connection that's already gone.
+    if(quickMatchWaiting && quickMatchWaiting.ws === ws) quickMatchWaiting = null;
+
+    if(!ws.myCode) return;
+    const room = rooms.get(ws.myCode);
     if(!room) return;
-    if(mySeat === 'host') room.host = null; else room.joiner = null;
-    send(mySeat === 'host' ? room.joiner : room.host, {type:'peer-left'});
-    closeRoomIfEmpty(myCode);
+    if(ws.mySeat === 'host') room.host = null; else room.joiner = null;
+    send(ws.mySeat === 'host' ? room.joiner : room.host, {type:'peer-left'});
+    closeRoomIfEmpty(ws.myCode);
   });
 });
- 
+
 server.listen(PORT, () => {
   console.log(`Football Auction relay server listening on port ${PORT}`);
 });
- 
